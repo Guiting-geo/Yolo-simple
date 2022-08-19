@@ -2,7 +2,7 @@
 """
 Created on Wed Aug 17 15:02:15 2022
 
-@author: Guiting
+@author: Administrator
 """
 
 import torch
@@ -19,7 +19,7 @@ import os
 import xml.etree.ElementTree as ET
 import cv2 as cv
 
-def xmltotext(rootpath,textname,xmlpath,jpgpath,resizepath,resize,classes_name):
+def xmltotext_resize(rootpath,textname,xmlpath,jpgpath,resizepath,resize,classes_name):
     ftext=open(os.path.join(rootpath, textname),'w')
     xml_list=os.listdir(xmlpath)
     for tmp in xml_list:
@@ -46,6 +46,7 @@ def xmltotext(rootpath,textname,xmlpath,jpgpath,resizepath,resize,classes_name):
                 cls_name=obj.find('name').text
                 cls_id=classes_name.index(cls_name)
                 xmlbox = obj.find('bndbox')
+                #[xmin,ymin,xmax,ymax]
                 boxes = np.array([int(xmlbox.find('xmin').text), int(xmlbox.find('ymin').text), int(xmlbox.find('xmax').text), int(xmlbox.find('ymax').text)],dtype=float)
                 
                 boxes[0]=boxes[0]/image_size[1]
@@ -61,6 +62,7 @@ def xmltotext(rootpath,textname,xmlpath,jpgpath,resizepath,resize,classes_name):
                 boxes[0] = boxes[0] + boxes[2] / 2
                 boxes[1] = boxes[1] + boxes[3] / 2
                 
+                #output [x_center,y_center,w,h,cls_id] 范围[0~1] 与resize无关
                 ftext.write(" " + ",".join([str(a) for a in boxes]) + ',' + str(cls_id)) 
 # =============================================================================
 #             if tmp.endswith("9_yello.xml"):
@@ -70,24 +72,6 @@ def xmltotext(rootpath,textname,xmlpath,jpgpath,resizepath,resize,classes_name):
 # =============================================================================
             ftext.write('\n')
 
-            
-def nms(boxes,threshold):
-    index=boxes[:,4].argsort()[::-1]
-    areas=(boxes[:,2]-boxes[:,0])*(boxes[:,3]-boxes[:,1])
-    keep=[]
-    while index.size >0:
-        keep.append(index[0])
-        x11=np.maximum(boxes[index[0],0],boxes[index[1:],0])
-        y11=np.maximum(boxes[index[0],1],boxes[index[1:],1])
-        x22=np.minimum(boxes[index[0],2],boxes[index[1:],2])
-        y22=np.minimum(boxes[index[0],3],boxes[index[1:],3])
-        ious=np.maximum(0,x22-x11)*np.maximum(0,y22-y11)/(areas[index[0]]+areas[index[1:]]-np.maximum(0,x22-x11)*np.maximum(0,y22-y11))
-        print(ious)
-        id=np.where(ious<threshold)[0]
-        index=index[id+1]
-    return keep
-
-
 class YoloDataSet(Dataset):
     def __init__(self,fline,transform=None):
         super(YoloDataSet, self).__init__()
@@ -96,16 +80,17 @@ class YoloDataSet(Dataset):
         self.transform = transform
     def __getitem__(self, index):
         line=self.lines[index].split()
+        #print(line[0])
         img=cv.imread(line[0])
         image_size=img.shape
         image_size = np.array(image_size, dtype=np.float32)
         if self.transform is not None:
             img = self.transform(img)
-        boxes=np.array([np.array(list(map(int,a.split(","))),dtype=np.int32) for a in line[1:]],dtype=np.int32)
-        #boxes x,y,w,h
-        if len(boxes>0):
-            boxes = np.array(boxes, dtype=np.float32)
+        tar=np.array([np.array(list(map(float,a.split(","))),dtype=np.float) for a in line[2:]],dtype=np.float)
+        #boxes x,y,w,h,cls_id   #float
 # =============================================================================
+#         if len(boxes>0):
+#             boxes = np.array(boxes, dtype=np.float32)
 #             boxes[:, 0] = boxes[:, 0] / image_size[1]        #x
 #             boxes[:, 1] = boxes[:, 1] / image_size[0]        #y     image_size[0]  h
 #             boxes[:, 2] = boxes[:, 2] / image_size[1]
@@ -120,7 +105,7 @@ class YoloDataSet(Dataset):
 #             boxes[:, 1] = boxes[:, 1] + boxes[:, 3] / 2
 # =============================================================================
         
-        return img, boxes
+        return img, tar
     def __len__(self):
         return self.batch_size
 
@@ -146,12 +131,28 @@ class YoloNet(nn.Module):
         x=self.addblock(x)
         return x
     
-    
+def nms(boxes,threshold):
+    #boxes [x1,y1,x2,y2] 左上右下
+    index=boxes[:,4].argsort()[::-1]
+    areas=(boxes[:,2]-boxes[:,0])*(boxes[:,3]-boxes[:,1])
+    keep=[]
+    while index.size >0:
+        keep.append(index[0])
+        x11=np.maximum(boxes[index[0],0],boxes[index[1:],0])
+        y11=np.maximum(boxes[index[0],1],boxes[index[1:],1])
+        x22=np.minimum(boxes[index[0],2],boxes[index[1:],2])
+        y22=np.minimum(boxes[index[0],3],boxes[index[1:],3])
+        ious=np.maximum(0,x22-x11)*np.maximum(0,y22-y11)/(areas[index[0]]+areas[index[1:]]-np.maximum(0,x22-x11)*np.maximum(0,y22-y11))
+        print(ious)
+        id=np.where(ious<threshold)[0]
+        index=index[id+1]
+    return keep
+
 class YoloLoss(nn.Module):
-    def __init__(self,pre,tar,anchors,image_size,num_classes,ignore_iou):
+    def __init__(self,pre,tar,anchors,num_classes,ignore_iou):
         super(YoloLoss,self).__init__()
         # pre [b,c,h,w]
-        self.image_size=image_size
+        
         self.anchor=anchors    #[3,2]
         self.num_anchors = len(anchors)
         self.num_classes=num_classes
@@ -197,7 +198,7 @@ class YoloLoss(nn.Module):
         iou = inter / (area1 + area2 - inter)
         return iou    
     def _built_target(self,tar,ignore_iou):
-        batch_size=tar.shape[0]
+        batch_size=self.batch_size
         in_w=self.grid_size[0]
         in_h=self.grid_size[1]
         tx=torch.zeros(batch_size,self.num_anchors,in_w,in_h,requires_grad=False)
@@ -214,12 +215,13 @@ class YoloLoss(nn.Module):
             for a in tar.shape[1]:
                 if tar[b,a].sum()==0:
                     continue
-                gx=tar[b,a,0]*in_w
+                # tar [0~1]
+                gx=tar[b,a,0]*in_w      #[0~in_w] [0~13]
                 gy=tar[b,a,1]*in_h
-                gw=tar[b,a,2]
+                gw=tar[b,a,2]            # anchor 需要提前归一化到0~1
                 gh=tar[b,a,3]
                 
-                tar_cls=int(tar[b,a,4])
+                tar_cls=int(tar[b,a,4])   # float --
                 gi=int(gx)
                 gj=int(gy)
                 
@@ -252,6 +254,18 @@ class YoloLoss(nn.Module):
         # pre [b,c,w,h]----->[b,num_anchors,5+num_classes,w,h]----->[b,num_anchors,w,h,5+num_classes,]
         if tar is not None:
             input_p=pre.view(self.batch_size,self.num_anchors,5+self.num_classes,self.grid_size[0],self.grid_size[1]).permute(0,1,3,4,2).contiguous()
+            
+            input_p[0,1,5,5,0:2]=0.9 
+            input_p[0,1,5,5,2:4]=0.0
+            input_p[0,1,5,5,4]=10
+            input_p[0,1,5,5,5]=10
+            
+            input_p[0,1,6,6,0:2]=0.0
+            input_p[0,1,6,6,2:4]=0.0
+            input_p[0,1,6,6,4]=10
+            input_p[0,1,6,6,5]=6
+            
+            
             
             x=torch.sigmoid(input_p[...,0])
             y=torch.sigmoid(input_p[...,1])
@@ -422,9 +436,17 @@ if __name__=='__main__':
     anchors=np.array([ [100,100], [200,200]],dtype=float)
     
     #[b,num_anchors,w,h,5+num_classes,]
-    pre=torch.zeros(batch_size,num_anchors*(5+num_classes),10,10) 
-           
-    boxes,scores,cls_=decode(pre,num_anchors,num_classes,anchors,image_size,ignore_confi,ignore_cls,ignore_iou)
+    input_p=torch.zeros(batch_size,num_anchors*(5+num_classes),13,13) 
+    tar=torch.zeros(batch_size,1,5) 
+    
+    #tar[0,1,0]=
+    
+    
+
+    
+    tt=YoloLoss(input_p,tar,anchors,num_classes,ignore_iou):
+    
+    #boxes,scores,cls_=decode(pre,num_anchors,num_classes,anchors,image_size,ignore_confi,ignore_cls,ignore_iou)
     
     
     
