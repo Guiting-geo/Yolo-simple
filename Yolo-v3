@@ -2,7 +2,7 @@
 """
 Created on Wed Aug 17 15:02:15 2022
 
-@author: Administrator
+@author: Guiting
 """
 
 import torch
