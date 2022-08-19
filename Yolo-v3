@@ -1,0 +1,449 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Wed Aug 17 15:02:15 2022
+
+@author: Administrator
+"""
+
+import torch
+import torch.nn as nn
+#import torch.nn.functional as F
+from torch.utils.data import Dataset
+from torchsummary import summary
+import torchvision.models as models
+
+import numpy as np 
+import math
+
+import os
+import xml.etree.ElementTree as ET
+import cv2 as cv
+
+def xmltotext(rootpath,textname,xmlpath,jpgpath,resizepath,resize,classes_name):
+    ftext=open(os.path.join(rootpath, textname),'w')
+    xml_list=os.listdir(xmlpath)
+    for tmp in xml_list:
+        if tmp.endswith('.xml'):
+            filename=tmp[:-4]+'.jpg'
+            
+            image = cv.imread(os.path.join(jpgpath,filename))
+            if image is None:
+                print(os.path.join(jpgpath,filename)+'is no exist ! \n')
+                continue
+            ftext.write(resizepath+filename)
+            image_size=image.shape
+            ftext.write(" "+",".join([str(a) for a in image_size[0:2] ]) )
+            
+            if resize is not None:
+                img=cv.resize(image,(resize))
+                cv.imwrite(resizepath+'%s.jpg'%(filename), img) 
+                print(resizepath+'%s.jpg'%(filename)+' is resized')
+                
+            tree=ET.parse(os.path.join(xmlpath, tmp))
+            root=tree.getroot()
+            
+            for obj in root.iter('object'):
+                cls_name=obj.find('name').text
+                cls_id=classes_name.index(cls_name)
+                xmlbox = obj.find('bndbox')
+                boxes = np.array([int(xmlbox.find('xmin').text), int(xmlbox.find('ymin').text), int(xmlbox.find('xmax').text), int(xmlbox.find('ymax').text)],dtype=float)
+                
+                boxes[0]=boxes[0]/image_size[1]
+                boxes[1]=boxes[1]/image_size[0]
+                boxes[2]=boxes[2]/image_size[1]
+                boxes[3]=boxes[3]/image_size[0]
+
+                #boxes = np.maximum(np.minimum(boxes, 1), 0)
+                
+                boxes[2] = boxes[2] - boxes[0]         # w
+                boxes[3] = boxes[3] - boxes[1]         # h
+
+                boxes[0] = boxes[0] + boxes[2] / 2
+                boxes[1] = boxes[1] + boxes[3] / 2
+                
+                ftext.write(" " + ",".join([str(a) for a in boxes]) + ',' + str(cls_id)) 
+# =============================================================================
+#             if tmp.endswith("9_yello.xml"):
+#                 draw1 = cv.rectangle(img, (boxes[0], boxes[1]), (boxes[2], boxes[3]), (0, 0, 255), 2)
+#                 cv.imshow("test", draw1)
+#                 cv.waitKey(0)
+# =============================================================================
+            ftext.write('\n')
+
+            
+def nms(boxes,threshold):
+    index=boxes[:,4].argsort()[::-1]
+    areas=(boxes[:,2]-boxes[:,0])*(boxes[:,3]-boxes[:,1])
+    keep=[]
+    while index.size >0:
+        keep.append(index[0])
+        x11=np.maximum(boxes[index[0],0],boxes[index[1:],0])
+        y11=np.maximum(boxes[index[0],1],boxes[index[1:],1])
+        x22=np.minimum(boxes[index[0],2],boxes[index[1:],2])
+        y22=np.minimum(boxes[index[0],3],boxes[index[1:],3])
+        ious=np.maximum(0,x22-x11)*np.maximum(0,y22-y11)/(areas[index[0]]+areas[index[1:]]-np.maximum(0,x22-x11)*np.maximum(0,y22-y11))
+        print(ious)
+        id=np.where(ious<threshold)[0]
+        index=index[id+1]
+    return keep
+
+
+class YoloDataSet(Dataset):
+    def __init__(self,fline,transform=None):
+        super(YoloDataSet, self).__init__()
+        self.lines=fline
+        self.batch_size=len(self.lines)
+        self.transform = transform
+    def __getitem__(self, index):
+        line=self.lines[index].split()
+        img=cv.imread(line[0])
+        image_size=img.shape
+        image_size = np.array(image_size, dtype=np.float32)
+        if self.transform is not None:
+            img = self.transform(img)
+        boxes=np.array([np.array(list(map(int,a.split(","))),dtype=np.int32) for a in line[1:]],dtype=np.int32)
+        #boxes x,y,w,h
+        if len(boxes>0):
+            boxes = np.array(boxes, dtype=np.float32)
+# =============================================================================
+#             boxes[:, 0] = boxes[:, 0] / image_size[1]        #x
+#             boxes[:, 1] = boxes[:, 1] / image_size[0]        #y     image_size[0]  h
+#             boxes[:, 2] = boxes[:, 2] / image_size[1]
+#             boxes[:, 3] = boxes[:, 3] / image_size[0]
+#             
+#             #boxes = np.maximum(np.minimum(boxes, 1), 0)
+#             
+#             boxes[:, 2] = boxes[:, 2] - boxes[:, 0]         # w
+#             boxes[:, 3] = boxes[:, 3] - boxes[:, 1]         # h
+# 
+#             boxes[:, 0] = boxes[:, 0] + boxes[:, 2] / 2
+#             boxes[:, 1] = boxes[:, 1] + boxes[:, 3] / 2
+# =============================================================================
+        
+        return img, boxes
+    def __len__(self):
+        return self.batch_size
+
+def yolo_dataset_collate(batch):
+    images = []
+    bboxes = []
+    for img, box in batch:
+        images.append(img)
+        bboxes.append(box)
+    images = np.array(images)
+    bboxes = np.array(bboxes)
+    return images, bboxes
+
+
+class YoloNet(nn.Module):
+    def __init__(self,backbone,num_anchors,num_classes):
+        super(YoloNet,self).__init__()
+        self.backbone=nn.Sequential(*list(backbone.children())[:-2])
+        out_channels=(num_classes+5)*num_anchors
+        self.addblock=nn.Conv2d(512, out_channels, kernel_size=1,stride=1)
+    def forward(self,x):
+        x=self.backbone(x)
+        x=self.addblock(x)
+        return x
+    
+    
+class YoloLoss(nn.Module):
+    def __init__(self,pre,tar,anchors,image_size,num_classes,ignore_iou):
+        super(YoloLoss,self).__init__()
+        # pre [b,c,h,w]
+        self.image_size=image_size
+        self.anchor=anchors    #[3,2]
+        self.num_anchors = len(anchors)
+        self.num_classes=num_classes
+        self.grid_size=pre.shape[2:]  # [w h]
+        self.batch_size=pre.shape[0]
+        
+        self.lambda_xy=2.5
+        self.lambda_wh=2.5
+        self.lambda_conf=1.0
+        self.lambda_cls=1.0
+    
+    def bbox_iou(box1, box2):
+        """Compute the intersection over union of two set of boxes, each box is [x1,y1,x2,y2].
+        Args:
+          box1: (tensor) bounding boxes, sized [N,4].
+          box2: (tensor) bounding boxes, sized [M,4].
+        Return:
+          (tensor) iou, sized [N,M].
+        """
+        # 首先计算两个box左上角点坐标的最大值和右下角坐标的最小值，然后计算交集面积，最后把交集面积除以对应的并集面积
+        N = box1.size(0)
+        M = box2.size(0)
+
+        lt = torch.max(  # 左上角的点
+            box1[:, :2].unsqueeze(1).expand(N, M, 2),  # [N,2] -> [N,1,2] -> [N,M,2]
+            box2[:, :2].unsqueeze(0).expand(N, M, 2),  # [M,2] -> [1,M,2] -> [N,M,2]
+        )
+
+        rb = torch.min(  # 右下角的点
+            box1[:, 2:].unsqueeze(1).expand(N, M, 2),  # [N,2] -> [N,1,2] -> [N,M,2]
+            box2[:, 2:].unsqueeze(0).expand(N, M, 2),  # [M,2] -> [1,M,2] -> [N,M,2]
+        )
+
+        wh = rb - lt  # [N,M,2]
+        wh[wh < 0] = 0  # clip at 指两个box没有重叠区域
+        inter = wh[:, :, 0] * wh[:, :, 1]  # [N,M]
+
+        area1 = (box1[:, 2]-box1[:, 0]) * (box1[:, 3]-box1[:, 1])  # [N,]
+        area2 = (box2[:, 2]-box2[:, 0]) * (box2[:, 3]-box2[:, 1])  # [M,]
+        area1 = area1.unsqueeze(1).expand_as(inter)  # [N,] -> [N,1] -> [N,M]
+        area2 = area2.unsqueeze(0).expand_as(inter)  # [M,] -> [1,M] -> [N,M]
+
+        iou = inter / (area1 + area2 - inter)
+        return iou    
+    def _built_target(self,tar,ignore_iou):
+        batch_size=tar.shape[0]
+        in_w=self.grid_size[0]
+        in_h=self.grid_size[1]
+        tx=torch.zeros(batch_size,self.num_anchors,in_w,in_h,requires_grad=False)
+        ty=torch.zeros(batch_size,self.num_anchors,in_w,in_h,requires_grad=False)
+        th=torch.zeros(batch_size,self.num_anchors,in_w,in_h,requires_grad=False)
+        tw=torch.zeros(batch_size,self.num_anchors,in_w,in_h,requires_grad=False)
+        tconf=torch.zeros(batch_size,self.num_anchors,in_w,in_h,requires_grad=False)
+        tcls=torch.zeros(batch_size,self.num_anchors,in_w,in_h,self.num_anchors,requires_grad=False)
+        
+        mask=torch.zeros(batch_size,self.num_anchors,in_w,in_h,requires_grad=False)  # 
+        no_mask=torch.ones(batch_size,self.num_anchors,in_w,in_h,requires_grad=False)
+        
+        for b in batch_size:
+            for a in tar.shape[1]:
+                if tar[b,a].sum()==0:
+                    continue
+                gx=tar[b,a,0]*in_w
+                gy=tar[b,a,1]*in_h
+                gw=tar[b,a,2]
+                gh=tar[b,a,3]
+                
+                tar_cls=int(tar[b,a,4])
+                gi=int(gx)
+                gj=int(gy)
+                
+                tar_box=torch.FloatTensor(np.array([0.0, 0.0, gw, gh])).unsqueeze(0) # [1,4]
+                
+                anchor_box = torch.FloatTensor(np.concatenate((np.zeros((self.num_anchors, 2)),
+                                                               np.array(self.anchors)), 1))
+
+                anchor_ious = self.bbox_iou(tar_box, anchor_box)
+                
+                best_anchor=np.argmax(anchor_ious)   #[1]
+                
+                mask[b,best_anchor,gi,gj]=1;
+                
+                no_mask[b,anchor_ious>ignore_iou,gi,gj]=0   #这里很有趣，没用best_anchor
+                
+                tx[b,best_anchor,gi,gj]=gx-gi    # 0~1
+                ty[b,best_anchor,gi,gj]=gy-gj
+                
+                tw[b,best_anchor,gi,gj]=math.log(gw/self.anchors[best_anchor,0]+1e-10)
+                th[b,best_anchor,gi,gj]=math.log(gh/self.anchors[best_anchor,1]+1e-10)
+                
+                tconf[b,best_anchor,gi,gj]=1
+                tcls[b,best_anchor,gi,gj,tar_cls]=1
+                
+        return mask, no_mask, tx,ty,tw,th,tconf,tcls
+                
+                
+    def forward(self,pre,tar,ignore_iou):
+        # pre [b,c,w,h]----->[b,num_anchors,5+num_classes,w,h]----->[b,num_anchors,w,h,5+num_classes,]
+        if tar is not None:
+            input_p=pre.view(self.batch_size,self.num_anchors,5+self.num_classes,self.grid_size[0],self.grid_size[1]).permute(0,1,3,4,2).contiguous()
+            
+            x=torch.sigmoid(input_p[...,0])
+            y=torch.sigmoid(input_p[...,1])
+            w=input_p[...,2]
+            h=input_p[...,3]
+            
+            conf=torch.sigmoid(input_p[...,4])
+            pre_cls=torch.sigmoid(input_p[...,5:])
+            mask, no_mask, tx,ty,tw,th,tconf,tcls=self._built_target(self,tar,ignore_iou)
+            
+            loss_x=nn.BCELoss(x*mask,tx*mask)
+            loss_y=nn.BCELoss(y*mask,ty*mask)
+            
+            loss_w=nn.MSELoss(w*mask,tw*mask)
+            loss_h=nn.MSELoss(h*mask,th*mask)
+
+            loss_conf=nn.BCELoss(conf*mask,mask) +  0.5*nn.BCELoss(conf*no_mask,0)         
+                
+            loss_cls = nn.BCELoss(pre_cls[mask == 1], tcls[mask == 1])   
+                
+             
+            loss = (loss_x + loss_y) * self.lambda_xy + \
+                   (loss_w + loss_h) * self.lambda_wh + \
+                   loss_conf * self.lambda_conf + \
+                   loss_cls * self.lambda_cls
+ 
+            return loss, loss_x.item(), loss_y.item(), loss_w.item(), loss_h.item(), loss_conf.item(), loss_cls.item()
+        else:
+            pass
+                
+def decode(pre,num_anchors,num_classes,anchors,image_size,ignore_confi,ignore_cls,ignore_iou):
+
+    batch_size=pre.shape[0]
+    in_w=pre.shape[2]
+    in_h=pre.shape[3]
+    
+    dx=image_size[1]*1.0/(in_w*1.0)
+    dy=image_size[0]*1.0/(in_h*1.0)
+
+
+    grid_w = np.arange(in_w)  
+    grid_h = np.arange(in_h)
+    a, b = np.meshgrid(grid_h, grid_w)  # x, y. 从左到右，从上到下遍历特征图的索引。
+
+    
+    # pre [b,c,w,h]----->[b,num_anchors,5+num_classes,w,h]----->[b,num_anchors,w,h,5+num_classes]
+    input_p=pre.view(batch_size,num_anchors,5+num_classes,in_w,in_h).permute(0,1,3,4,2).contiguous()
+    
+    input_p[:,:,:,:,5:5+num_classes]=torch.sigmoid(input_p[:,:,:,:,5:5+num_classes])
+    #[b,num_anchors,w,h,5+num_classes,]
+    input_p[0,1,5,5,0:2]=0.9 
+    input_p[0,1,5,5,2:4]=0.0
+    input_p[0,1,5,5,4]=10
+    input_p[0,1,5,5,5]=10
+    
+    input_p[0,1,6,6,0:2]=0.0
+    input_p[0,1,6,6,2:4]=0.0
+    input_p[0,1,6,6,4]=10
+    input_p[0,1,6,6,5]=6
+     
+    for i in range(in_w):
+        for j in range(in_h):
+            input_p[:,:,i,j,0]=(torch.sigmoid(input_p[:,:,i,j,0])+i)*dx
+            input_p[:,:,i,j,1]=(torch.sigmoid(input_p[:,:,i,j,1])+j)*dy
+    
+    #anchors.
+    anchors[:,0] =anchors[:,0]
+    anchors[:,1] =anchors[:,1]
+    #print(anchors)
+    for i in range(num_anchors):
+        input_p[:,i,:,:,2]=torch.exp(input_p[:,i,:,:,2])* anchors[i,0]
+        input_p[:,i,:,:,3]=torch.exp(input_p[:,i,:,:,3])* anchors[i,1]
+     
+    mask=(input_p[:, :,:,:, 4]>ignore_confi).unsqueeze(-1).expand_as(input_p)
+    # mask=torch.where(input_p[:, :,:,:, 4]>ignore_confi)
+            
+    boxes=input_p[mask].view(-1,7).contiguous()
+    scores=boxes[:,5:5+num_classes]*boxes[:,4].unsqueeze(1).expand_as(boxes[:,5:5+num_classes])
+
+    cls_inds = torch.argmax(scores, axis=1)
+    
+    scores=scores[  (np.arange(scores.shape[0]), cls_inds)  ]
+    
+    # 第一次删除
+    keep=torch.where(scores>ignore_cls)[0]
+    
+    scores=scores[keep]
+    boxes=boxes[keep]
+    cls_inds=cls_inds[keep]
+    
+    boxes[:,0]=boxes[:,0]-boxes[:,2]/2
+    boxes[:,1]=boxes[:,1]-boxes[:,3]/2
+    
+    boxes[:,2]=boxes[:,0]+boxes[:,2]
+    boxes[:,3]=boxes[:,1]+boxes[:,3]
+    
+    
+    keep = torch.zeros(len(boxes)) 
+    for i in range(num_classes):
+        icls=torch.where(cls_inds==i)[0]
+        if len(icls)==0:
+            continue
+        c_boxes=torch.cat( (boxes[icls,:4],scores[icls].unsqueeze(1)),1)
+        print(i,c_boxes)
+        inms=nms(c_boxes.numpy(),ignore_iou)
+        keep[icls[inms]]=1
+        
+    keep=torch.where(keep>0)
+        
+    return boxes[keep],scores[keep],cls_inds[keep] #boxes[icls,:5]  #   [  (np.arange(scores.shape[0]), cls_inds)  ]
+    #for i in range
+# =============================================================================
+#     
+#     
+#     
+#     
+#     
+#     
+#     # pre [b,c,w,h]----->[b,c,w*h]
+#     prediction = pre.view(batch_size, num_anchors*(5+num_classes), in_w* in_h)
+#     
+#     # pre [b,c,w*h]----->[b,w*h,c]
+#     prediction = prediction.transpose(1, 2).contiguous()
+#     
+#     # pre [b,w*h,c]----->[b,w*h*num_anchors,5+num_classes]
+#     prediction = prediction.view(batch_size, in_w* in_h * num_anchors, 5+num_classes)
+# 
+# 
+#     prediction[:, :, 4] = torch.sigmoid(prediction[:, :, 4])  # object confidencce
+#     
+#         for i in in_w:
+#             for j in in_h:
+#                 if prediction[:, , 4]>ignore_confi:
+#                     prediction[:, :, 0]=torch.sigmoid(prediction[:, :, 0])+i*dx
+#                     prediction[:, :, 1]=torch.sigmoid(prediction[:, :, 1])+j*dy       
+# 
+# 
+#                 
+#     
+#     mask=prediction[:, :, 4]<ignore_confi
+#     mask = mask.unsqueeze(-1).expand_as(prediction)
+# =============================================================================
+    #return  #prediction[mask==1].view(-1,5+num_classes) #prediction[:, :, 4] #mask  #prediction[mask] #mask==1  #prediction[mask==1, :]
+
+                
+if __name__=='__main__':
+    
+    xmlpath=r'plate/yello/xml'
+    
+    jpgpath=r'plate/yello/'
+    
+    rootpath=r'./'
+
+    resizepath=r'plate/yello/resize/'
+
+    classes_name = ["yello","blue"]
+
+    textname=r'train.txt'
+    
+    
+    batch_size=1
+    num_anchors=2
+    num_classes=2 
+    ignore_confi=0.5
+    ignore_cls=0.8
+    ignore_iou=0.5
+    image_size=np.array([400,400],dtype=float)
+    anchors=np.array([ [100,100], [200,200]],dtype=float)
+    
+    #[b,num_anchors,w,h,5+num_classes,]
+    pre=torch.zeros(batch_size,num_anchors*(5+num_classes),10,10) 
+           
+    boxes,scores,cls_=decode(pre,num_anchors,num_classes,anchors,image_size,ignore_confi,ignore_cls,ignore_iou)
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+            
