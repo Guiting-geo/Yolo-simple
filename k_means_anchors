@@ -1,0 +1,89 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Fri Aug 19 15:42:00 2022
+
+@author: Administrator
+"""
+import os
+import xml.etree.ElementTree as ET
+import numpy as np 
+
+xmlpath=r'plate/yello/xml'
+jpgpath=r'plate/yello/'
+rootpath=r'./'
+resizepath=r'plate/yello/resize/'
+
+
+def box_iou(boxe,clusters):
+    x=np.minimum(boxe[0],clusters[:,0])
+    y=np.minimum(boxe[1],clusters[:,1])
+    
+    intersection=x*y
+    
+    area1=boxe[0]*boxe[1]
+    area2=clusters[:,0]*clusters[:,1]
+    
+    iou=intersection/(area1+area2-intersection)
+    return iou
+    
+def avg_iou(box, cluster):
+    return np.mean([np.max(box_iou(box[i], cluster)) for i in range(box.shape[0])])
+    k_means_anchors
+def k_means_anchors(xmlpath,k):
+    xml_list=os.listdir(xmlpath)
+    boxes=[]
+    for tmp in xml_list:
+        if tmp.endswith('.xml'):
+            tree=ET.parse(os.path.join(xmlpath,tmp))
+           
+            height = int(tree.findtext('./size/height'))
+            width = int(tree.findtext('./size/width'))
+            if height<=0 & width<=0:
+                continue
+            root=tree.getroot()
+            for obj in root.iter('object'):
+                xmlbox = obj.find('bndbox')
+                box = np.array([int(xmlbox.find('xmin').text), int(xmlbox.find('ymin').text), int(xmlbox.find('xmax').text), int(xmlbox.find('ymax').text)],dtype=float)
+                box[0]=(box[2]-box[0])/width
+                box[1]=(box[3]-box[1])/height
+                
+                boxes.append([box[0],box[1]])
+    boxes=np.array(boxes)
+    num_box=len(boxes)
+    
+    np.random.seed()
+    cluster=boxes[np.random.choice(num_box,k,replace=False)]
+    #print(cluster)
+    tt=avg_iou(boxes, cluster)
+    print(tt)
+    cluster_id=np.zeros(num_box)
+    last_clu = np.zeros((num_box,))
+    #tt=np.argmax(box_iou(boxes[0],cluster),1)
+    distance = np.empty((num_box, k))
+    
+    while True:
+        for i in range(num_box):
+            distance[i]=box_iou(boxes[i],cluster)
+        cluster_id=np.argmax(distance,1)
+            
+        if (last_clu == cluster_id).all():
+            break
+    
+        for j in range(k):
+            #cluster[j]=np.median(boxes[cluster_id==j],axis=0)
+            cluster[j]=np.mean(boxes[cluster_id==j],axis=0)
+        
+
+        last_clu = cluster_id
+    
+    tt=avg_iou(boxes, cluster)
+    print(tt)
+    return boxes,cluster
+ 
+boxes,cluster=k_means_anchors(xmlpath,4) 
+
+cluster=cluster[np.argsort(cluster[:,0])]
+print(cluster)
+
+    
+            
