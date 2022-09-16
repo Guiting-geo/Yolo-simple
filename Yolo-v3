@@ -13,6 +13,8 @@ import torch.nn as nn
 from torch.utils.data import Dataset
 from torchsummary import summary
 import torchvision.models as models
+import torchvision
+import torch.optim as optim
 
 import numpy as np 
 import math
@@ -160,7 +162,7 @@ class YoloDataSet(Dataset):
         if self.transform is not None:
             img = self.transform(img)
         tar=np.array([np.array(list(map(float,a.split(","))),dtype=np.float) for a in line[2:]],dtype=np.float)
-        #boxes x,y,w,h,cls_id   #float
+        #boxes x,y,w,h,cls_id   #fl
         # tar [num_obj,5]
 # =============================================================================
 #         if len(boxes>0):
@@ -229,7 +231,7 @@ class YoloLoss(nn.Module):
         # tar [b,num_obj,5]
         
         self.anchors=anchors    #[3,2]
-        self.num_anchors = len(anchors)
+        self.num_anchors = anchors.shape[0]
         self.num_classes=num_classes
         self.grid_size=pre.shape[2:]  # [w h] [13 13]
         self.batch_size=pre.shape[0]
@@ -288,6 +290,7 @@ class YoloLoss(nn.Module):
         
         for b in batch_size:
             for a in tar.shape[1]:
+                # tar [b,num_obj,5]
                 if tar[b,a].sum()==0:
                     continue
                 # tar [0~1]
@@ -303,9 +306,9 @@ class YoloLoss(nn.Module):
                 tar_box=torch.FloatTensor(np.array([0.0, 0.0, gw, gh])).unsqueeze(0) # [1,4]
                 
                 anchor_box = torch.FloatTensor(np.concatenate((np.zeros((self.num_anchors, 2)),
-                                                               np.array(self.anchors)), 1))
-
-                anchor_ious = self.bbox_iou(tar_box, anchor_box)
+                                                               np.array(self.anchors)), 1))    #[3 4]
+                    
+                anchor_ious = self.bbox_iou(tar_box, anchor_box)  #[1 3]
                 
                 best_anchor=np.argmax(anchor_ious)   #[1]
                 
@@ -367,7 +370,8 @@ class YoloLoss(nn.Module):
                    loss_conf * self.lambda_conf + \
                    loss_cls * self.lambda_cls
  
-            return loss, loss_x.item(), loss_y.item(), loss_w.item(), loss_h.item(), loss_conf.item(), loss_cls.item()
+            #return loss, loss_x.item(), loss_y.item(), loss_w.item(), loss_h.item(), loss_conf.item(), loss_cls.item()
+            return loss
         else:
             pass
                 
@@ -403,13 +407,13 @@ def decode(pre,num_anchors,num_classes,anchors,image_size,ignore_confi,ignore_cl
      
     for i in range(in_w):
         for j in range(in_h):
-            input_p[:,:,i,j,0]=(torch.sigmoid(input_p[:,:,i,j,0])+i)*dx
+            input_p[:,:,i,j,0]=(torch.sigmoid(input_p[:,:,i,j,0])+i)*dx    # 正常尺寸
             input_p[:,:,i,j,1]=(torch.sigmoid(input_p[:,:,i,j,1])+j)*dy
     
     #print(anchors)
     for i in range(num_anchors):
-        input_p[:,i,:,:,2]=torch.exp(input_p[:,i,:,:,2])* anchors[i,0]
-        input_p[:,i,:,:,3]=torch.exp(input_p[:,i,:,:,3])* anchors[i,1]
+        input_p[:,i,:,:,2]=torch.exp(input_p[:,i,:,:,2])* anchors[i,0]*dx 
+        input_p[:,i,:,:,3]=torch.exp(input_p[:,i,:,:,3])* anchors[i,1]*dy 
      
     mask=(input_p[:, :,:,:, 4]>ignore_confi).unsqueeze(-1).expand_as(input_p)
     # mask=torch.where(input_p[:, :,:,:, 4]>ignore_confi)
@@ -493,13 +497,20 @@ if __name__=='__main__':
 
     resizepath=r'plate/yello/resize/'
 
-    classes_name = ["yello","blue"]
+    classes_name = ["car","nocar"]
 
     textname=r'train.txt'
     
     anchor_path = r'yolo_anchors.txt'
     
     
+    n_epochs = 3
+    learning_rate = 0.01
+    momentum = 0.5
+    log_interval = 10
+    random_seed = 1
+    torch.manual_seed(random_seed)
+   
     batch_size=1
     num_anchors=5
     num_classes=2 
@@ -507,7 +518,7 @@ if __name__=='__main__':
     ignore_cls=0.8
     ignore_iou=0.5
     image_size=np.array([400,400],dtype=float)
-    anchors=np.array([ [100,100], [200,200]],dtype=float)
+    #anchors=np.array([ [100,100], [200,200], [300,300]],dtype=float)
 
     with open(anchor_path) as f:
         lines = f.readlines()
@@ -527,13 +538,71 @@ if __name__=='__main__':
     #tar[0,1,0]=
     
     
+    backbone=models.resnet34(pretrained=True)
+    net=YoloNet(backbone,3,1) 
+    #def __init__(self,backbone,num_anchors,num_classes):# import torchvision.models as models
+    optimizer = optim.SGD(net.parameters(), lr=learning_rate, momentum=momentum)
+    summary(net, (3, 400, 400))
     
-    
+
     #tt=YoloLoss(input_p,tar,anchors,num_classes,ignore_iou):
     
     #boxes,scores,cls_=decode(pre,num_anchors,num_classes,anchors,image_size,ignore_confi,ignore_cls,ignore_iou)
     
     
+    
+
+    with open(textname) as f:
+        lines = f.readlines()
+    
+    train_iter = torch.utils.data.DataLoader(
+    YoloDataSet(lines[:20],
+                transform=torchvision.transforms.Compose([
+                torchvision.transforms.ToTensor()
+                               ])),
+    batch_size=4, shuffle=True,collate_fn=yolo_dataset_collate)
+    
+    
+    train_losses = []
+    train_counter = []
+    test_losses = []
+    test_counter = [i * len(train_iter.dataset) for i in range(n_epochs + 1)]
+
+    for epoch in range(1, n_epochs + 1):
+        net.train()
+        for batch_idx, (data, target) in enumerate(train_iter):
+            optimizer.zero_grad()
+            pre = net(data)
+            loss = YoloLoss(pre,target,anchors,num_classes,ignore_iou)
+            loss.backward()
+            optimizer.step()
+            if batch_idx % log_interval == 0:
+                print('Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}'.format(epoch, batch_idx * len(data),
+                                                                               len(train_iter.dataset),
+                                                                               100. * batch_idx / len(train_iter),
+                                                                               loss.item()))
+                train_losses.append(loss.item())
+                train_counter.append((batch_idx * 64) + ((epoch - 1) * len(train_iter.dataset)))
+                torch.save(net.state_dict(), './model.pth')
+                torch.save(optimizer.state_dict(), './optimizer.pth')
+   
+            
+            
+            
+    
+    
+    # for X, y in train_iter:
+    #     i=1
+    #     img= X[0].cpu().numpy()
+    #     img2 = img.transpose(1,2,0)
+    #     img3 = cv.cvtColor(img2, cv.COLOR_RGB2BGR)
+    #     #box=y[0][0]
+    #     #draw1 = cv.rectangle(img3, (box[0], box[1]), (box[2], box[3]), (0, 0, 255), 2)
+    #     #cv.imshow("cs", draw1)
+    #     cv.imshow("cs", img3)
+    #     #cv.waitKey()
+    #     #cv.imshow("test", X[0,:])
+    #     cv.waitKey(0)    
     
     
     
