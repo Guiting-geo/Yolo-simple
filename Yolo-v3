@@ -1,8 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-Created on Wed Aug 17 15:02:15 2022
+@author: Guiting
 
-@author: Administrator
+YOLO v1,v3
+从头一步步搭建YOLO
+有空更新，尽量详细注释
 """
 
 import torch
@@ -19,7 +21,9 @@ import os
 import xml.etree.ElementTree as ET
 import cv2 as cv
 
-def xmltotext_resize(rootpath,textname,xmlpath,jpgpath,resizepath,resize,classes_name):
+def xmltotext_and_resize(rootpath,textname,xmlpath,jpgpath,resizepath,resize,classes_name):
+    # xml文件转化为text output=[路径 原始图像.shape x_center,y_center,w,h,cls_id]
+    # resize后的图片保存路径为resizepath
     ftext=open(os.path.join(rootpath, textname),'w')
     xml_list=os.listdir(xmlpath)
     for tmp in xml_list:
@@ -63,6 +67,7 @@ def xmltotext_resize(rootpath,textname,xmlpath,jpgpath,resizepath,resize,classes
                 boxes[1] = boxes[1] + boxes[3] / 2
                 
                 #output [x_center,y_center,w,h,cls_id] 范围[0~1] 与resize无关
+                
                 ftext.write(" " + ",".join([str(a) for a in boxes]) + ',' + str(cls_id)) 
 # =============================================================================
 #             if tmp.endswith("9_yello.xml"):
@@ -71,6 +76,74 @@ def xmltotext_resize(rootpath,textname,xmlpath,jpgpath,resizepath,resize,classes
 #                 cv.waitKey(0)
 # =============================================================================
             ftext.write('\n')
+            
+            
+def box_iou(boxe,clusters):
+    x=np.minimum(boxe[0],clusters[:,0])
+    y=np.minimum(boxe[1],clusters[:,1])
+    
+    intersection=x*y
+    
+    area1=boxe[0]*boxe[1]
+    area2=clusters[:,0]*clusters[:,1]
+    
+    iou=intersection/(area1+area2-intersection)
+    return iou
+    
+def avg_iou(box, cluster):
+    return np.mean([np.max(box_iou(box[i], cluster)) for i in range(box.shape[0])])
+
+
+def k_means_anchors(xmlpath,k):
+    xml_list=os.listdir(xmlpath)
+    boxes=[]
+    for tmp in xml_list:
+        if tmp.endswith('.xml'):
+            tree=ET.parse(os.path.join(xmlpath,tmp))
+           
+            height = int(tree.findtext('./size/height'))
+            width = int(tree.findtext('./size/width'))
+            if height<=0 & width<=0:
+                continue
+            root=tree.getroot()
+            for obj in root.iter('object'):
+                xmlbox = obj.find('bndbox')
+                box = np.array([int(xmlbox.find('xmin').text), int(xmlbox.find('ymin').text), int(xmlbox.find('xmax').text), int(xmlbox.find('ymax').text)],dtype=float)
+                box[0]=(box[2]-box[0])/width
+                box[1]=(box[3]-box[1])/height
+                
+                boxes.append([box[0],box[1]])
+    boxes=np.array(boxes)
+    num_box=len(boxes)
+    
+    np.random.seed()
+    cluster=boxes[np.random.choice(num_box,k,replace=False)]
+    #print(cluster)
+    tt=avg_iou(boxes, cluster)
+    print(tt)
+    cluster_id=np.zeros(num_box)
+    last_clu = np.zeros((num_box,))
+    #tt=np.argmax(box_iou(boxes[0],cluster),1)
+    distance = np.empty((num_box, k))
+    
+    while True:
+        for i in range(num_box):
+            distance[i]=box_iou(boxes[i],cluster)
+        cluster_id=np.argmax(distance,1)
+        
+        if (last_clu == cluster_id).all():
+            break
+    
+        for j in range(k):
+            cluster[j]=np.median(boxes[cluster_id==j],axis=0)
+            #cluster[j]=np.mean(boxes[cluster_id==j],axis=0)
+        
+
+        last_clu = cluster_id
+    
+    tt=avg_iou(boxes, cluster)
+    print(tt)
+    return boxes,cluster
 
 class YoloDataSet(Dataset):
     def __init__(self,fline,transform=None):
@@ -88,6 +161,7 @@ class YoloDataSet(Dataset):
             img = self.transform(img)
         tar=np.array([np.array(list(map(float,a.split(","))),dtype=np.float) for a in line[2:]],dtype=np.float)
         #boxes x,y,w,h,cls_id   #float
+        # tar [num_obj,5]
 # =============================================================================
 #         if len(boxes>0):
 #             boxes = np.array(boxes, dtype=np.float32)
@@ -151,12 +225,13 @@ def nms(boxes,threshold):
 class YoloLoss(nn.Module):
     def __init__(self,pre,tar,anchors,num_classes,ignore_iou):
         super(YoloLoss,self).__init__()
-        # pre [b,c,h,w]
+        # pre [b,num_anchors,w,h]
+        # tar [b,num_obj,5]
         
-        self.anchor=anchors    #[3,2]
+        self.anchors=anchors    #[3,2]
         self.num_anchors = len(anchors)
         self.num_classes=num_classes
-        self.grid_size=pre.shape[2:]  # [w h]
+        self.grid_size=pre.shape[2:]  # [w h] [13 13]
         self.batch_size=pre.shape[0]
         
         self.lambda_xy=2.5
@@ -216,9 +291,9 @@ class YoloLoss(nn.Module):
                 if tar[b,a].sum()==0:
                     continue
                 # tar [0~1]
-                gx=tar[b,a,0]*in_w      #[0~in_w] [0~13]
+                gx=tar[b,a,0]*in_w      #0~1 to 0~13  center
                 gy=tar[b,a,1]*in_h
-                gw=tar[b,a,2]            # anchor 需要提前归一化到0~1
+                gw=tar[b,a,2]           # gw,gh [0~1]  w,h需要提前归一化到0~1
                 gh=tar[b,a,3]
                 
                 tar_cls=int(tar[b,a,4])   # float --
@@ -331,9 +406,6 @@ def decode(pre,num_anchors,num_classes,anchors,image_size,ignore_confi,ignore_cl
             input_p[:,:,i,j,0]=(torch.sigmoid(input_p[:,:,i,j,0])+i)*dx
             input_p[:,:,i,j,1]=(torch.sigmoid(input_p[:,:,i,j,1])+j)*dy
     
-    #anchors.
-    anchors[:,0] =anchors[:,0]
-    anchors[:,1] =anchors[:,1]
     #print(anchors)
     for i in range(num_anchors):
         input_p[:,i,:,:,2]=torch.exp(input_p[:,i,:,:,2])* anchors[i,0]
@@ -425,16 +497,29 @@ if __name__=='__main__':
 
     textname=r'train.txt'
     
+    anchor_path = r'yolo_anchors.txt'
+    
     
     batch_size=1
-    num_anchors=2
+    num_anchors=5
     num_classes=2 
     ignore_confi=0.5
     ignore_cls=0.8
     ignore_iou=0.5
     image_size=np.array([400,400],dtype=float)
     anchors=np.array([ [100,100], [200,200]],dtype=float)
-    
+
+    with open(anchor_path) as f:
+        lines = f.readlines()
+        lines=lines[0].split()
+
+    anchors=[]
+    for i in range(len(lines)):
+        [w,h]=lines[i].split(',')
+        anchors.append([w,h])
+    anchors=np.array(anchors,dtype=float)
+
+
     #[b,num_anchors,w,h,5+num_classes,]
     input_p=torch.zeros(batch_size,num_anchors*(5+num_classes),13,13) 
     tar=torch.zeros(batch_size,1,5) 
@@ -442,9 +527,9 @@ if __name__=='__main__':
     #tar[0,1,0]=
     
     
-
     
-    tt=YoloLoss(input_p,tar,anchors,num_classes,ignore_iou):
+    
+    #tt=YoloLoss(input_p,tar,anchors,num_classes,ignore_iou):
     
     #boxes,scores,cls_=decode(pre,num_anchors,num_classes,anchors,image_size,ignore_confi,ignore_cls,ignore_iou)
     
