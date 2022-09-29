@@ -162,6 +162,9 @@ class YoloDataSet(Dataset):
         if self.transform is not None:
             img = self.transform(img)
         tar=np.array([np.array(list(map(float,a.split(","))),dtype=float) for a in line[2:]],dtype=float)
+        tar=np.pad(tar, ((0, 12-tar.shape[0]),(0, 0)),'edge')
+        # tar 可能是多目标，补齐12个
+        
         #boxes x,y,w,h,cls_id   #fl
         # tar [num_obj,5]
 # =============================================================================
@@ -180,7 +183,6 @@ class YoloDataSet(Dataset):
 #             boxes[:, 0] = boxes[:, 0] + boxes[:, 2] / 2
 #             boxes[:, 1] = boxes[:, 1] + boxes[:, 3] / 2
 # =============================================================================
-        
         return img, tar
     def __len__(self):
         return self.batch_size
@@ -521,7 +523,7 @@ if __name__=='__main__':
     n_epochs = 20
     learning_rate = 0.01
     momentum = 0.5
-    log_interval = 50
+    log_interval = 5
     random_seed = 1
     torch.manual_seed(random_seed)
    
@@ -568,10 +570,10 @@ if __name__=='__main__':
         lines = f.readlines()
     
     train_iter = torch.utils.data.DataLoader(
-YoloDataSet(lines[:20],
+YoloDataSet(lines,
             transform=torchvision.transforms.Compose([
             torchvision.transforms.ToTensor()
-                           ])),batch_size=4, shuffle=True)
+                           ])),batch_size=batch_size, shuffle=True)
     
     
     train_losses = []
@@ -588,8 +590,7 @@ YoloDataSet(lines[:20],
             pre = net(data)
             loss = Loss_f(pre,target,ignore_iou)
             #print(loss)
-            #def forward(self,pre,tar,ignore_iou):
-                
+            #def forward(self,pre,tar,ignore_iou): 
             loss.backward()
             optimizer.step()
             if batch_idx % log_interval == 0:
@@ -598,29 +599,12 @@ YoloDataSet(lines[:20],
                                                                                 100. * batch_idx / len(train_iter),
                                                                                 loss.item()))
                 train_losses.append(loss.item())
-                train_counter.append((batch_idx * 64) + ((epoch - 1) * len(train_iter.dataset)))
+                #train_counter.append((batch_idx * batch_size) + ((epoch - 1) * len(train_iter.dataset)))
                 #torch.save(net.state_dict(), './model.pth')
                 #torch.save(optimizer.state_dict(), './optimizer.pth')
    
             
-            
-            
-    
-    
-    # for X, y in train_iter:
-    #     i=1
-    #     img= X[0].cpu().numpy()
-    #     img2 = img.transpose(1,2,0)
-    #     img3 = cv.cvtColor(img2, cv.COLOR_RGB2BGR)
-    #     #box=y[0][0]
-    #     #draw1 = cv.rectangle(img3, (box[0], box[1]), (box[2], box[3]), (0, 0, 255), 2)
-    #     #cv.imshow("cs", draw1)
-    #     cv.imshow("cs", img3)
-    #     #cv.waitKey()
-    #     #cv.imshow("test", X[0,:])
-    #     cv.waitKey(0)    
-    
-    
+      
     
     
     
